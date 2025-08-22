@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
             } else {
                 bail!("No path or size provided");
             };
+            endpoint.home_relay().initialized().await;
             let addr = endpoint.node_addr().initialized().await;
             let proto = BlobsProtocol::new(&store, endpoint.clone(), None);
             let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -66,8 +67,8 @@ async fn main() -> Result<()> {
             target,
             verbose,
             block_size,
-            parallelism
-         } => {
+            parallelism,
+        } => {
             sync(tickets, target, block_size, verbose, parallelism).await?;
         }
     }
@@ -119,7 +120,13 @@ async fn get_latencies_and_sizes(
         .await
 }
 
-async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, block_size_chunks: u64, verbose: u8, parallelism: usize) -> Result<()> {
+async fn sync(
+    tickets: Vec<BlobTicket>,
+    target: Option<PathBuf>,
+    block_size_chunks: u64,
+    verbose: u8,
+    parallelism: usize,
+) -> Result<()> {
     let block_size = ChunkNum(block_size_chunks);
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = tickets
@@ -672,12 +679,11 @@ struct Ctx {
 }
 
 impl Ctx {
-
     /// download range task.
     ///
     /// This is a separate fn since we want to thread through id, hash and ranges
     /// even in case of an error.
-    /// 
+    ///
     /// A result of None indicates that the task has been killed. This should not
     /// count towards errors.
     async fn download_range(
@@ -793,7 +799,7 @@ mod cli {
             verbose: u8,
 
             /// Block size in BLAKE3 chunks of 1024 bytes.
-            /// 
+            ///
             /// Making this too large will reduce adaptation rate.
             ///
             /// if size / (block_size * 1024) is larger than the number of
