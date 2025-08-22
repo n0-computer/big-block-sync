@@ -477,20 +477,24 @@ mod cli {
     #[derive(Subcommand, Clone, Debug)]
     pub enum Commands {
         /// Launch an iroh node and provide the content at the given path
+        ///
+        /// This is just a standard iroh-blobs provide, it is only in the
+        /// example so the example is self-contained.
         Provide {
             /// path to the file you want to provide.
             ///
-            /// This is just a standard iroh-blobs provide, it is only in the
-            /// example so the example is self-contained.
             path: PathBuf,
         },
+        /// Syncs a blob from multiple sources, given as tickets.
+        ///
+        /// As opposed to other examples, the blobs must not have the same hash!
+        /// They just must have the same size. The resulting file will be
+        /// built out of ranges of the source blobs, but will not necessarily
+        /// have the same hash as any of the input blobs unless there is only
+        /// one provider.
+        ///
+        /// Syncing does not accept connections, it is a pure client.
         Sync {
-            /// Syncs a blob from multiple sources.
-            ///
-            /// As opposed to other examples, the blobs must not have the same hash!
-            /// They just must have the same size. The resulting file will be
-            /// built out of ranges of the source blobs, but will not necessarily
-            /// have the same hash as
             tickets: Vec<BlobTicket>,
 
             /// Path to the file where the synced content will be saved
