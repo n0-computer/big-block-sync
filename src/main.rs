@@ -87,8 +87,8 @@ async fn get_latency_and_size(
     hash: &Hash,
 ) -> Result<(Duration, u64)> {
     let conn = pool.get_or_connect(*node_id).await?;
-    let (size, stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
-    let latency = stats.elapsed;
+    let (size, _stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
+    let latency = conn.rtt();
     Ok((latency, size))
 }
 
