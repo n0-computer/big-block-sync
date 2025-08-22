@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     ops::DerefMut,
     path::PathBuf,
@@ -150,7 +151,12 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) ->
         .iter()
         .filter_map(|(id, res)| res.as_ref().ok().map(|(l, _)| (*id, *l)))
         .collect::<HashMap<_, _>>();
-    println!("{:?}", latency);
+    if verbose > 0 {
+        println!("Node       Initial Latency (ms)");
+        for (id, l) in &latency {
+            println!("{} {:<8.3}ms", id.fmt_short(), l.as_secs_f64() * 1000.0);
+        }
+    }
     // Print non-reachable nodes
     for (id, r) in latencies_and_sizes {
         if r.is_err() {
@@ -159,7 +165,7 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) ->
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
     let block_size = ChunkNum(1024); // 1 MiB block size
-    let downloader = Downloader::new(hashes, size, block_size, pool);
+    let downloader = Downloader::new(hashes, size, block_size, pool, &latency);
     let (res, stats) = downloader
         .run()
         .await
@@ -241,16 +247,104 @@ struct PerNodeStats {
     time: Duration,
     // start of the current download
     start: Option<Instant>,
+    // initial latency
+    latency: Duration,
 }
 
+impl PerNodeStats {
+    /// Total number of chunks downloaded from this node
+    fn total_chunks(&self) -> Option<ChunkNum> {
+        total_chunks(&self.ranges)
+    }
+
+    /// Total number of bytes downloaded from this node
+    fn total_bytes(&self) -> Option<usize> {
+        Some(self.total_chunks()?.to_bytes() as usize)
+    }
+
+    /// Download rate from this node, if available
+    fn rate(&self) -> Option<f64> {
+        let total = self.total_bytes()?;
+        if self.time == Duration::ZERO {
+            // we have not yet downloaded anything!
+            return None;
+        }
+        Some(total as f64 / self.time.as_secs_f64())
+    }
+
+    /// Quality metric for this node, lower is better
+    fn quality(&self) -> Quality {
+        Quality::new(self.errors, self.rate(), self.latency)
+    }
+}
+
+/// Quality metric for this node, lower is better
+///
+/// Ordering is as follows:
+/// - connections without errors will be preferred, lower errors wins
+/// - connections with rate will be preferred, higher rate wins
+/// - connections without rate will be sorted by latency, lower wins
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Quality {
+    errors: u64,
+    rate: Reverse<Option<u64>>, // Some comes first, higher rates come first
+    latency: Duration,
+}
+
+impl Quality {
+    fn new(errors: u64, rate: Option<f64>, latency: Duration) -> Self {
+        Self {
+            errors,
+            rate: Reverse(rate.map(|x| x as u64)),
+            latency,
+        }
+    }
+}
+#[test]
+fn test_quality_ordering() {
+    let mut qualities = vec![
+        // Worst: high errors, no rate, high latency
+        Quality::new(2, None, Duration::from_millis(100)),
+        // Bad: high errors with rate
+        Quality::new(2, Some(1000.5), Duration::from_millis(20)),
+        // Medium: some errors, no rate, low latency
+        Quality::new(1, None, Duration::from_millis(10)),
+        // Good: no errors, no rate
+        Quality::new(0, None, Duration::from_millis(50)),
+        // Better: no errors, low rate
+        Quality::new(0, Some(500.8), Duration::from_millis(30)),
+        // Same rate after truncation, higher latency (worse)
+        Quality::new(0, Some(2000.9), Duration::from_millis(40)),
+        // Same rate after truncation, lower latency (better)
+        Quality::new(0, Some(2000.1), Duration::from_millis(10)),
+        // Best: no errors, highest rate, lowest latency
+        Quality::new(0, Some(3000.0), Duration::from_millis(5)),
+    ];
+
+    qualities.sort();
+
+    // Verify the sorted order (best to worst)
+    let expected = vec![
+        Quality::new(0, Some(3000.0), Duration::from_millis(5)), // Best
+        Quality::new(0, Some(2000.1), Duration::from_millis(10)), // Same rate after truncation, lower latency wins
+        Quality::new(0, Some(2000.9), Duration::from_millis(40)), // Same rate after truncation, higher latency
+        Quality::new(0, Some(500.8), Duration::from_millis(30)),
+        Quality::new(0, None, Duration::from_millis(50)), // No rate, uses latency
+        Quality::new(1, None, Duration::from_millis(10)),
+        Quality::new(2, Some(1000.5), Duration::from_millis(20)),
+        Quality::new(2, None, Duration::from_millis(100)), // Worst
+    ];
+
+    assert_eq!(qualities, expected);
+}
 fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
-    println!("Node{}\tErrors\tChunks\tDuration\tRate", " ".repeat(64 - 3));
+    println!("Node       Errors\tChunks\tDuration\tRate");
     for (id, stat) in stats {
-        let total = total_chunks(&stat.ranges).unwrap_or(ChunkNum(0));
-        let rate = (total.0 as f64) / 1024.0 / stat.time.as_secs_f64();
+        let total = stat.total_chunks().unwrap_or_default();
+        let rate = stat.rate().unwrap_or(f64::NAN);
         println!(
             "{}\t{}\t{}\t{:<8.3}s\t{:<8.3} MiB/s",
-            id,
+            id.fmt_short(),
             stat.errors,
             total.0,
             stat.time.as_secs_f64(),
@@ -332,6 +426,7 @@ impl Downloader {
         size: usize,
         block_size: ChunkNum,
         pool: ConnectionPool,
+        latency: &HashMap<NodeId, Duration>,
     ) -> Self {
         let target = Target::new(size);
         let unclaimed = target.missing.clone();
@@ -344,7 +439,18 @@ impl Downloader {
             unclaimed,
             hashes,
             current: HashMap::new(),
-            stats: HashMap::new(),
+            stats: latency
+                .iter()
+                .map(|(id, l)| {
+                    (
+                        *id,
+                        PerNodeStats {
+                            latency: *l,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
             block_size,
         }
     }
@@ -398,7 +504,7 @@ impl Downloader {
 
     fn spawn_download(&mut self, id: NodeId, claim: ChunkRanges) {
         let hash = self.hashes[&id].clone();
-        info!("Downloading chunks {:?} from {}", claim, id);
+        info!("Downloading chunks {:?} from {}", claim, id.fmt_short());
         self.unclaimed -= claim.clone();
         let (tx, rx) = oneshot::channel();
         self.current.insert(id, tx);
