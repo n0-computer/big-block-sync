@@ -65,8 +65,10 @@ async fn main() -> Result<()> {
             tickets,
             target,
             verbose,
-        } => {
-            sync(tickets, target, verbose).await?;
+            block_size,
+            parallelism
+         } => {
+            sync(tickets, target, block_size, verbose, parallelism).await?;
         }
     }
     Ok(())
@@ -117,7 +119,8 @@ async fn get_latencies_and_sizes(
         .await
 }
 
-async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) -> Result<()> {
+async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, block_size_chunks: u64, verbose: u8, parallelism: usize) -> Result<()> {
+    let block_size = ChunkNum(block_size_chunks);
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = tickets
         .iter()
@@ -172,8 +175,7 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) ->
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let block_size = ChunkNum(1024); // 1 MiB block size
-    let downloader = Downloader::new(hashes, size, block_size, pool, &latency, 8);
+    let downloader = Downloader::new(hashes, size, block_size, pool, &latency, parallelism);
     let (res, stats) = downloader
         .run()
         .await
@@ -436,7 +438,7 @@ fn print_bitfields(stats: &HashMap<NodeId, PerNodeStats>, size: usize) {
 
 struct Downloader {
     ctx: Arc<Ctx>,
-    tasks: FuturesUnordered<Boxed<(NodeId, ChunkRanges, anyhow::Result<()>)>>,
+    tasks: FuturesUnordered<Boxed<(NodeId, ChunkRanges, Option<anyhow::Result<()>>)>>,
     unclaimed: ChunkRanges,
     hashes: HashMap<NodeId, Hash>,
     stats: HashMap<NodeId, PerNodeStats>,
@@ -482,6 +484,18 @@ impl Downloader {
         }
     }
 
+    /// Best n nodes, free or busy (for quality, lower is better)
+    fn all_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
+        let mut qualities: Vec<_> = self
+            .stats
+            .iter()
+            .map(|(id, stat)| (stat.quality(), *id))
+            .collect();
+        qualities.sort();
+        qualities.truncate(n);
+        qualities
+    }
+
     /// Give the first n free nodes by quality (for quality, lower is better)
     fn free_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
         let mut qualities: Vec<_> = self
@@ -511,7 +525,7 @@ impl Downloader {
     }
 
     /// Update state based on task result
-    fn handle_task_result(&mut self, res: (NodeId, ChunkRanges, anyhow::Result<()>)) {
+    fn handle_task_result(&mut self, res: (NodeId, ChunkRanges, Option<anyhow::Result<()>>)) {
         let (id, ranges, result) = res;
         let stats = self.stats.entry(id).or_default();
         self.current.remove(&id);
@@ -520,11 +534,16 @@ impl Downloader {
             .start
             .expect("Start time should be set when spawning download");
         stats.time += start.elapsed();
-        if result.is_err() {
+        let success = matches!(result, Some(Ok(_)));
+        if !success {
             // add back unclaimed ranges since the download failed
             let target = self.ctx.target.lock().unwrap();
             self.unclaimed |= ranges & target.missing.clone();
-            stats.errors += 1;
+            if result.is_some() {
+                // only increase error count if there was an actual error.
+                // when we kill the task that is not the fault of the remote node.
+                stats.errors += 1;
+            }
         }
     }
 
@@ -643,16 +662,24 @@ struct Ctx {
 }
 
 impl Ctx {
+
+    /// download range task.
+    ///
+    /// This is a separate fn since we want to thread through id, hash and ranges
+    /// even in case of an error.
+    /// 
+    /// A result of None indicates that the task has been killed. This should not
+    /// count towards errors.
     async fn download_range(
         self: Arc<Self>,
         id: NodeId,
         hash: Hash,
         ranges: ChunkRanges,
         cancel: oneshot::Receiver<()>,
-    ) -> (NodeId, ChunkRanges, anyhow::Result<()>) {
+    ) -> (NodeId, ChunkRanges, Option<anyhow::Result<()>>) {
         let result = tokio::select! {
-            res = self.download_range_impl(id, hash, ranges.clone()) => res,
-            _ = cancel => Err(anyhow::anyhow!("Download cancelled")),
+            res = self.download_range_impl(id, hash, ranges.clone()) => Some(res),
+            _ = cancel => None,
         };
         (id, ranges.clone(), result)
     }
@@ -748,8 +775,27 @@ mod cli {
             #[clap(long)]
             target: Option<PathBuf>,
 
+            /// Verbosity level
+            ///
+            /// 1 will show stats,
+            /// 2 will show stats and bitfields
             #[arg(short, long, action = clap::ArgAction::Count)]
             verbose: u8,
+
+            /// Block size in BLAKE3 chunks of 1024 bytes.
+            /// 
+            /// Making this too large will reduce adaptation rate.
+            ///
+            /// if size / (block_size * 1024) is larger than the number of
+            /// nodes to download from, you will get reduced parallelism.
+            #[arg(long, default_value_t = 1024)]
+            block_size: u64,
+
+            /// Parallelism level. Even when many nodes are provided, the
+            /// downloader will not use all of them concurrently but will try
+            /// to choose the best ones.
+            #[arg(long, default_value_t = 8)]
+            parallelism: usize,
         },
     }
 }
