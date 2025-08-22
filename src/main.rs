@@ -307,7 +307,22 @@ impl Quality {
             latency,
         }
     }
+
+    fn rate(&self) -> Option<u64> {
+        self.rate.0
+    }
 }
+
+impl std::fmt::Display for Quality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "errors: {}, rate: {:?}, latency: {:?}",
+            self.errors, self.rate.0, self.latency
+        )
+    }
+}
+
 #[test]
 fn test_quality_ordering() {
     // thanks claude!
@@ -467,7 +482,7 @@ impl Downloader {
         }
     }
 
-    /// Looks at stats, sorts them by quality, and returns up to n free nodes.
+    /// Give the first n free nodes by quality (for quality, lower is better)
     fn free_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
         let mut qualities: Vec<_> = self
             .stats
@@ -476,6 +491,21 @@ impl Downloader {
             .map(|(id, stat)| (stat.quality(), *id))
             .collect();
         qualities.sort();
+        qualities.truncate(n);
+        qualities
+    }
+
+    /// Give the first n busy nodes by reverse quality (higher, so worse, qualities first)
+    ///
+    /// The worst node should come first.
+    fn busy_by_quality_rev(&self, n: usize) -> Vec<(Quality, NodeId)> {
+        let mut qualities: Vec<_> = self
+            .stats
+            .iter()
+            .filter(|(id, _)| self.current.contains_key(*id))
+            .map(|(id, stat)| (stat.quality(), *id))
+            .collect();
+        qualities.sort_by(|a, b| b.cmp(a));
         qualities.truncate(n);
         qualities
     }
@@ -513,16 +543,58 @@ impl Downloader {
             if !claim.is_empty() {
                 // choose the best node to download from. In many cases this will be the same node
                 // that we just used, but not always. E.g. if the op produced an error.
-                let best = self.free_by_quality(1);
-                let Some((_, id)) = best.first() else {
+                let Some((_, id)) = self.free_by_quality(1).into_iter().next() else {
                     // this should never happen unless we started with 0 nodes.
                     // even nodes with errors will be considered here!
                     bail!("No free nodes available to download from");
                 };
                 // todo: abort here if even the best node has lots of errors?
-                self.spawn_download(*id, claim);
+                self.spawn_download(id, claim);
             } else {
-                // todo: go into finish mode
+                // find the worst busy node
+                let Some((worst_current, current_id)) =
+                    self.busy_by_quality_rev(1).into_iter().next()
+                else {
+                    continue;
+                };
+                let Some((best_free, _)) = self.free_by_quality(1).into_iter().next() else {
+                    // this should never happen unless we started with 0 nodes.
+                    // even nodes with errors will be considered here!
+                    bail!("No free nodes available to download from");
+                };
+                if worst_current < best_free {
+                    // worst_current is better than best_free, so we can keep it running
+                    continue;
+                }
+                // we don't look at actually downloaded data for the worst. Maybe we should, because
+                // it might be almost done. But then again, probably does not matter.
+                let kill = match (worst_current.rate(), best_free.rate()) {
+                    // both have rates, kill if worst rate is much worse than best free rate
+                    (Some(w), Some(b)) => w * 4 < b,
+                    // worst current has a rate, but best free does not, so we can keep it running
+                    (Some(_), None) => false,
+                    // worst current has no rate, but best free does. kill it.
+                    (None, Some(_)) => true,
+                    // we don't know rate for any, might as well let it run
+                    (None, None) => false,
+                };
+
+                if kill {
+                    info!(
+                        "Killing download from {} because best free is much better",
+                        current_id.fmt_short()
+                    );
+                    info!("curr: {}", worst_current);
+                    info!("free: {}", best_free);
+                    // just cancelling the current worst download is enough.
+                    // this will make room in claimed and respawn a new download,
+                    // unless the download has finished by now.
+                    self.current
+                        .remove(&current_id)
+                        .expect("Current ID should be in current")
+                        .send(())
+                        .ok();
+                }
             }
         }
         let target = std::mem::take(self.ctx.target.lock().unwrap().deref_mut());
