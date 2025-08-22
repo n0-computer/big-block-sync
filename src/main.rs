@@ -24,6 +24,7 @@ use iroh_blobs::{
 mod common;
 use common::{get_or_generate_secret_key, setup_logging};
 use n0_future::{BufferedStreamExt, FuturesUnordered, StreamExt, future::Boxed, stream};
+use rand::RngCore;
 use range_collections::range_set::RangeSetRange;
 use tokio::sync::oneshot;
 use tracing::info;
@@ -33,16 +34,23 @@ async fn main() -> Result<()> {
     setup_logging();
     let args = cli::Args::parse();
     match args.command {
-        cli::Commands::Provide { path } => {
+        cli::Commands::Provide { path, n } => {
             let secret = get_or_generate_secret_key()?;
             let store = iroh_blobs::store::mem::MemStore::new();
             let endpoint = endpoint::Endpoint::builder()
                 .secret_key(secret)
                 .bind()
                 .await?;
-            let path = path.canonicalize()?;
-            let tag = store.add_path(path).await?;
-            endpoint.home_relay().initialized().await;
+            let tag = if let Some(path) = path {
+                store.add_path(path).await?
+            } else if let Some(n) = n {
+                let mut rng = rand::thread_rng();
+                let mut data = vec![0u8; n];
+                rng.fill_bytes(&mut data);
+                store.add_bytes(data).await?
+            } else {
+                bail!("No path or size provided");
+            };
             let addr = endpoint.node_addr().initialized().await;
             let proto = BlobsProtocol::new(&store, endpoint.clone(), None);
             let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -165,7 +173,7 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) ->
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
     let block_size = ChunkNum(1024); // 1 MiB block size
-    let downloader = Downloader::new(hashes, size, block_size, pool, &latency);
+    let downloader = Downloader::new(hashes, size, block_size, pool, &latency, 8);
     let (res, stats) = downloader
         .run()
         .await
@@ -302,6 +310,7 @@ impl Quality {
 }
 #[test]
 fn test_quality_ordering() {
+    // thanks claude!
     let mut qualities = vec![
         // Worst: high errors, no rate, high latency
         Quality::new(2, None, Duration::from_millis(100)),
@@ -341,7 +350,7 @@ fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
     println!("Node       Errors\tChunks\tDuration\tRate");
     for (id, stat) in stats {
         let total = stat.total_chunks().unwrap_or_default();
-        let rate = stat.rate().unwrap_or(f64::NAN);
+        let rate = stat.rate().unwrap_or(f64::NAN) / (1024.0 * 1024.0);
         println!(
             "{}\t{}\t{}\t{:<8.3}s\t{:<8.3} MiB/s",
             id.fmt_short(),
@@ -418,6 +427,7 @@ struct Downloader {
     stats: HashMap<NodeId, PerNodeStats>,
     current: HashMap<NodeId, oneshot::Sender<()>>,
     block_size: ChunkNum,
+    parallelism: usize,
 }
 
 impl Downloader {
@@ -427,6 +437,7 @@ impl Downloader {
         block_size: ChunkNum,
         pool: ConnectionPool,
         latency: &HashMap<NodeId, Duration>,
+        parallelism: usize,
     ) -> Self {
         let target = Target::new(size);
         let unclaimed = target.missing.clone();
@@ -452,41 +463,66 @@ impl Downloader {
                 })
                 .collect(),
             block_size,
+            parallelism,
+        }
+    }
+
+    /// Looks at stats, sorts them by quality, and returns up to n free nodes.
+    fn free_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
+        let mut qualities: Vec<_> = self
+            .stats
+            .iter()
+            .filter(|(id, _)| !self.current.contains_key(*id))
+            .map(|(id, stat)| (stat.quality(), *id))
+            .collect();
+        qualities.sort();
+        qualities.truncate(n);
+        qualities
+    }
+
+    fn handle_task_result(&mut self, res: (NodeId, ChunkRanges, anyhow::Result<()>)) {
+        let (id, ranges, result) = res;
+        let stats = self.stats.entry(id).or_default();
+        self.current.remove(&id);
+        stats.ranges |= ranges.clone();
+        let start = stats
+            .start
+            .expect("Start time should be set when spawning download");
+        stats.time += start.elapsed();
+        if result.is_err() {
+            // add back unclaimed ranges since the download failed
+            let target = self.ctx.target.lock().unwrap();
+            self.unclaimed |= ranges & target.missing.clone();
+            stats.errors += 1;
         }
     }
 
     async fn run(mut self) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
         let chunk_size = self.block_size;
-        for (id, _) in self.hashes.clone() {
+        let initial = self.free_by_quality(self.parallelism);
+        for (_, id) in initial {
             let claim = claim(&self.unclaimed, chunk_size);
             if claim.is_empty() {
                 break;
             }
             self.spawn_download(id, claim);
         }
-        loop {
-            tokio::select! {
-                res = self.tasks.next() => {
-                    let Some((id, ranges, result)) = res else {
-                        break;
-                    };
-                    let stats = self.stats.entry(id).or_default();
-                    self.current.remove(&id);
-                    stats.ranges |= ranges.clone();
-                    let start = stats.start.expect("Start time should be set when spawning download");
-                    stats.time += start.elapsed();
-                    if result.is_err() {
-                        let target = self.ctx.target.lock().unwrap();
-                        self.unclaimed |= ranges & target.missing.clone();
-                        stats.errors += 1;
-                    }
-                    let claim = claim(&self.unclaimed, chunk_size);
-                    if !claim.is_empty() {
-                        self.spawn_download(id, claim);
-                    } else {
-                        // todo: go into finish mode
-                    }
-                }
+        while let Some(res) = self.tasks.next().await {
+            self.handle_task_result(res);
+            let claim = claim(&self.unclaimed, chunk_size);
+            if !claim.is_empty() {
+                // choose the best node to download from. In many cases this will be the same node
+                // that we just used, but not always. E.g. if the op produced an error.
+                let best = self.free_by_quality(1);
+                let Some((_, id)) = best.first() else {
+                    // this should never happen unless we started with 0 nodes.
+                    // even nodes with errors will be considered here!
+                    bail!("No free nodes available to download from");
+                };
+                // todo: abort here if even the best node has lots of errors?
+                self.spawn_download(*id, claim);
+            } else {
+                // todo: go into finish mode
             }
         }
         let target = std::mem::take(self.ctx.target.lock().unwrap().deref_mut());
@@ -601,9 +637,14 @@ mod cli {
         ///
         /// This is just a standard iroh-blobs provide, it is only in the
         /// example so the example is self-contained.
+        #[group(required = true, multiple = false)]
         Provide {
             /// path to the file you want to provide.
-            path: PathBuf,
+            path: Option<PathBuf>,
+
+            /// Size in bytes, data will be randomly generated
+            #[arg(long, short)]
+            n: Option<usize>,
         },
         /// Syncs a blob from multiple sources, given as tickets.
         ///
