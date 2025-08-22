@@ -6,11 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
-use bao_tree::{blake3, io::BaoContentItem, ChunkNum, ChunkRanges};
+use anyhow::{Context, Result, bail};
+use bao_tree::{ChunkNum, ChunkRanges, blake3, io::BaoContentItem};
 use clap::Parser;
-use iroh::{discovery::static_provider::StaticProvider, endpoint, Endpoint, NodeId, Watcher};
+use iroh::{Endpoint, NodeId, Watcher, discovery::static_provider::StaticProvider, endpoint};
 use iroh_blobs::{
+    BlobFormat, BlobsProtocol, Hash,
     get::{
         self,
         fsm::{BlobContentNext, ConnectedNext, EndBlobNext},
@@ -18,15 +19,13 @@ use iroh_blobs::{
     protocol::{ChunkRangesExt, GetRequest},
     ticket::BlobTicket,
     util::connection_pool::ConnectionPool,
-    BlobFormat, BlobsProtocol, Hash,
 };
 mod common;
 use common::{get_or_generate_secret_key, setup_logging};
-use n0_future::{future::Boxed, stream, BufferedStreamExt, FuturesUnordered, StreamExt};
+use n0_future::{BufferedStreamExt, FuturesUnordered, StreamExt, future::Boxed, stream};
 use range_collections::range_set::RangeSetRange;
 use tokio::sync::oneshot;
-
-use crate::stats::ConnectionStats;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,8 +52,12 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
-        cli::Commands::Sync { tickets, target } => {
-            sync(tickets, target).await?;
+        cli::Commands::Sync {
+            tickets,
+            target,
+            verbose,
+        } => {
+            sync(tickets, target, verbose).await?;
         }
     }
     Ok(())
@@ -105,7 +108,7 @@ async fn get_latencies_and_sizes(
         .await
 }
 
-async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>) -> Result<()> {
+async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, verbose: u8) -> Result<()> {
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = tickets
         .iter()
@@ -155,11 +158,18 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>) -> Result<()> {
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let downloader = Downloader::new(hashes, size, pool);
-    let res = downloader
+    let block_size = ChunkNum(1024); // 1 MiB block size
+    let downloader = Downloader::new(hashes, size, block_size, pool);
+    let (res, stats) = downloader
         .run()
         .await
         .context("Failed to download content")?;
+    if verbose > 0 {
+        print_stats(&stats);
+    }
+    if verbose > 1 {
+        print_bitfields(&stats, size);
+    }
     if let Some(target) = target {
         tokio::fs::write(target, res)
             .await
@@ -172,6 +182,19 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn total_chunks(ranges: &ChunkRanges) -> Option<ChunkNum> {
+    let mut res = 0;
+    for range in ranges.iter() {
+        match range {
+            RangeSetRange::Range(r) => {
+                res += r.end.0 - r.start.0;
+            }
+            RangeSetRange::RangeFrom(_) => return None,
+        }
+    }
+    Some(ChunkNum(res))
 }
 
 /// Claim up to max chunks from the unclaimed chunks.
@@ -202,112 +225,95 @@ fn claim(unclaimed: &ChunkRanges, max: ChunkNum) -> ChunkRanges {
     res
 }
 
-/// Connection statistics - not used for now!
-mod stats {
-    #![allow(dead_code)]
-    use std::{
-        collections::{BTreeMap, HashMap},
-        time::Instant,
-    };
-
-    use iroh::NodeId;
-
-    #[derive(Debug, Default)]
-    struct ConnectionStatsInner {
-        stats: HashMap<NodeId, PerNodeStats>,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    pub struct ConnectionStats {
-        data: tokio::sync::watch::Sender<ConnectionStatsInner>,
-    }
-
-    #[derive(Debug, Default)]
-    struct PerNodeStats {
-        log: BTreeMap<Instant, ConnectionEvent>,
-    }
-
-    impl ConnectionStatsInner {
-        fn insert(&mut self, id: NodeId, at: Instant, event: ConnectionEvent) {
-            self.stats.entry(id).or_default().log.insert(at, event);
-        }
-    }
-
-    impl ConnectionStats {
-        fn log(&self, node: NodeId, at: Instant, event: ConnectionEvent) {
-            self.data.send_modify(|x| {
-                x.insert(node, at, event);
-            });
-        }
-
-        pub fn start(&self, node: NodeId, at: Instant) -> Recorder {
-            self.log(node, at, ConnectionEvent::Start);
-            Recorder {
-                id: node,
-                data: self.data.clone(),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct Recorder {
-        id: NodeId,
-        data: tokio::sync::watch::Sender<ConnectionStatsInner>,
-    }
-
-    impl Recorder {
-        pub fn download(&self, at: Instant, bytes: u64) {
-            self.data.send_modify(|x| {
-                x.insert(self.id, at, ConnectionEvent::Download(bytes));
-            });
-        }
-
-        pub fn end(self, at: Instant, success: bool) {
-            self.data.send_modify(|x| {
-                x.insert(
-                    self.id,
-                    at,
-                    ConnectionEvent::End(if success {
-                        EndReason::Success
-                    } else {
-                        EndReason::Error
-                    }),
-                );
-            });
-        }
-    }
-
-    impl Drop for Recorder {
-        fn drop(&mut self) {
-            self.data.send_modify(|x| {
-                x.insert(
-                    self.id,
-                    Instant::now(),
-                    ConnectionEvent::End(EndReason::Drop),
-                );
-            });
-        }
-    }
-
-    #[derive(Debug)]
-    enum ConnectionEvent {
-        Start,
-        Download(u64),
-        End(EndReason),
-    }
-
-    #[derive(Debug)]
-    enum EndReason {
-        Success,
-        Error,
-        Drop,
-    }
-}
-
 #[derive(Debug, Default)]
 struct Target {
     data: Vec<u8>,
     missing: ChunkRanges,
+}
+
+#[derive(Debug, Default)]
+struct PerNodeStats {
+    // total downloaded chunks from this node
+    ranges: ChunkRanges,
+    // error count
+    errors: u64,
+    // total time this node was downloading
+    time: Duration,
+    // start of the current download
+    start: Option<Instant>,
+}
+
+fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
+    println!("Node{}\tErrors\tChunks\tDuration\tRate", " ".repeat(64 - 3));
+    for (id, stat) in stats {
+        let total = total_chunks(&stat.ranges).unwrap_or(ChunkNum(0));
+        let rate = (total.0 as f64) / 1024.0 / stat.time.as_secs_f64();
+        println!(
+            "{}\t{}\t{}\t{:<8.3}s\t{:<8.3} MiB/s",
+            id,
+            stat.errors,
+            total.0,
+            stat.time.as_secs_f64(),
+            rate
+        );
+    }
+}
+
+fn print_bitfield(bitfield: &ChunkRanges, size: usize) -> String {
+    let bucket_size_bytes = (size + 99) / 100;
+    let buckets = (size + bucket_size_bytes - 1) / bucket_size_bytes;
+    let mut count = vec![0usize; buckets];
+    for range in bitfield.iter() {
+        match range {
+            RangeSetRange::Range(r) => {
+                // thanks claude!
+                let range_start_bytes = r.start.0 as usize * 1024;
+                let range_end_bytes = r.end.0 as usize * 1024; // exclusive
+
+                let start_bucket = range_start_bytes / bucket_size_bytes;
+                let end_bucket = (range_end_bytes - 1) / bucket_size_bytes; // Last actual byte
+
+                for bucket_idx in start_bucket..=end_bucket.min(buckets - 1) {
+                    let bucket_start = bucket_idx * bucket_size_bytes;
+                    let bucket_end = ((bucket_idx + 1) * bucket_size_bytes).min(size);
+
+                    let overlap_start = range_start_bytes.max(bucket_start);
+                    let overlap_end = range_end_bytes.min(bucket_end);
+
+                    count[bucket_idx] += overlap_end - overlap_start;
+                }
+            }
+            RangeSetRange::RangeFrom(_) => {
+                return "Open range".into();
+            }
+        }
+    }
+    fn bucket_to_char(count: usize, bucket_size_bytes: usize) -> char {
+        let ratio = count as f64 / bucket_size_bytes as f64;
+        match ratio {
+            r if r == 0.0 => ' ',   // Empty (white/background)
+            r if r <= 0.125 => '░', // Light gray
+            r if r <= 0.25 => '░',  // Light gray
+            r if r <= 0.375 => '▒', // Medium gray
+            r if r <= 0.5 => '▒',   // Medium gray
+            r if r <= 0.625 => '▓', // Dark gray
+            r if r <= 0.75 => '▓',  // Dark gray
+            r if r <= 0.875 => '█', // Almost black
+            _ => '█',               // Full black
+        }
+    }
+    count
+        .iter()
+        .map(|&c| bucket_to_char(c, bucket_size_bytes))
+        .collect()
+}
+
+fn print_bitfields(stats: &HashMap<NodeId, PerNodeStats>, size: usize) {
+    println!("Node       Bitfield");
+    for (id, stat) in stats {
+        let bitfield_str = print_bitfield(&stat.ranges, size);
+        println!("{} {}", id.fmt_short(), bitfield_str);
+    }
 }
 
 struct Downloader {
@@ -315,16 +321,22 @@ struct Downloader {
     tasks: FuturesUnordered<Boxed<(NodeId, ChunkRanges, anyhow::Result<()>)>>,
     unclaimed: ChunkRanges,
     hashes: HashMap<NodeId, Hash>,
+    stats: HashMap<NodeId, PerNodeStats>,
     current: HashMap<NodeId, oneshot::Sender<()>>,
+    block_size: ChunkNum,
 }
 
 impl Downloader {
-    fn new(hashes: HashMap<NodeId, Hash>, size: usize, pool: ConnectionPool) -> Self {
+    fn new(
+        hashes: HashMap<NodeId, Hash>,
+        size: usize,
+        block_size: ChunkNum,
+        pool: ConnectionPool,
+    ) -> Self {
         let target = Target::new(size);
         let unclaimed = target.missing.clone();
         Self {
             ctx: Arc::new(Ctx {
-                stats: ConnectionStats::default(),
                 target: Mutex::new(target),
                 pool,
             }),
@@ -332,11 +344,13 @@ impl Downloader {
             unclaimed,
             hashes,
             current: HashMap::new(),
+            stats: HashMap::new(),
+            block_size,
         }
     }
 
-    async fn run(mut self) -> Result<Vec<u8>> {
-        let chunk_size = ChunkNum(1024);
+    async fn run(mut self) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
+        let chunk_size = self.block_size;
         for (id, _) in self.hashes.clone() {
             let claim = claim(&self.unclaimed, chunk_size);
             if claim.is_empty() {
@@ -350,10 +364,15 @@ impl Downloader {
                     let Some((id, ranges, result)) = res else {
                         break;
                     };
+                    let stats = self.stats.entry(id).or_default();
                     self.current.remove(&id);
+                    stats.ranges |= ranges.clone();
+                    let start = stats.start.expect("Start time should be set when spawning download");
+                    stats.time += start.elapsed();
                     if result.is_err() {
                         let target = self.ctx.target.lock().unwrap();
                         self.unclaimed |= ranges & target.missing.clone();
+                        stats.errors += 1;
                     }
                     let claim = claim(&self.unclaimed, chunk_size);
                     if !claim.is_empty() {
@@ -374,24 +393,23 @@ impl Downloader {
             "Target should have no missing ranges at the end"
         );
         // take the target out of the context
-        Ok(target.data)
+        Ok((target.data, self.stats))
     }
 
     fn spawn_download(&mut self, id: NodeId, claim: ChunkRanges) {
+        let hash = self.hashes[&id].clone();
+        info!("Downloading chunks {:?} from {}", claim, id);
         self.unclaimed -= claim.clone();
         let (tx, rx) = oneshot::channel();
         self.current.insert(id, tx);
-        self.tasks.push(Box::pin(self.ctx.clone().download_range(
-            id,
-            self.hashes[&id],
-            claim,
-            rx,
-        )));
+        self.stats.entry(id).or_default().start = Some(Instant::now());
+        self.tasks.push(Box::pin(
+            self.ctx.clone().download_range(id, hash, claim, rx),
+        ));
     }
 }
 
 struct Ctx {
-    stats: ConnectionStats,
     target: Mutex<Target>,
     pool: ConnectionPool,
 }
@@ -423,7 +441,6 @@ impl Ctx {
         let ConnectedNext::StartRoot(root) = connected.next().await? else {
             bail!("Expected StartRoot state");
         };
-        let recorder = self.stats.start(id, Instant::now());
         let (mut c, _size) = root.next().next().await?;
         let end = loop {
             match c.next().await {
@@ -434,7 +451,6 @@ impl Ctx {
                         let mut target = self.target.lock().unwrap();
                         target.data[offset..offset + len].copy_from_slice(&leaf.data);
                         target.missing -= ChunkRanges::bytes(leaf.offset..leaf.offset + len as u64);
-                        recorder.download(Instant::now(), len as u64);
                     }
                     c = c1;
                 }
@@ -446,7 +462,6 @@ impl Ctx {
         let EndBlobNext::Closing(closing) = end.next() else {
             bail!("Expected Closing state");
         };
-        recorder.end(Instant::now(), true);
         let _stats = closing.next().await?;
         Ok(())
     }
@@ -482,7 +497,6 @@ mod cli {
         /// example so the example is self-contained.
         Provide {
             /// path to the file you want to provide.
-            ///
             path: PathBuf,
         },
         /// Syncs a blob from multiple sources, given as tickets.
@@ -500,6 +514,9 @@ mod cli {
             /// Path to the file where the synced content will be saved
             #[clap(long)]
             target: Option<PathBuf>,
+
+            #[arg(short, long, action = clap::ArgAction::Count)]
+            verbose: u8,
         },
     }
 }

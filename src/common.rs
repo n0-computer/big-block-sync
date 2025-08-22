@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use anyhow::Result;
 use iroh::SecretKey;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Gets a secret key from the IROH_SECRET environment variable or generates a new random one.
 /// If the environment variable is set, it must be a valid string representation of a secret key.

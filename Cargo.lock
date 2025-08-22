@@ -274,6 +274,7 @@ dependencies = [
  "bao-tree",
  "clap",
  "hex",
+ "human",
  "iroh",
  "iroh-blobs",
  "n0-future 0.2.0",
@@ -1333,6 +1334,17 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "human"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a33606e2411fedf1c59f5f155c2657ef024b5d07e6734d455c90c66ca905c0d0"
+dependencies = [
+ "stick",
+ "wasm-bindgen",
+ "web-sys",
+]
 
 [[package]]
 name = "hyper"
@@ -3527,6 +3539,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smelling_salts"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2692f084bca749bf1496cb442450bb4fd9ce511cceab14133416700ea42f34"
+
+[[package]]
 name = "snafu"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3598,6 +3616,17 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+
+[[package]]
+name = "stick"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15d96c3182e4d16584264e6dfee9493f0418cc32c888b3f9cedef67893cc6e50"
+dependencies = [
+ "serde",
+ "smelling_salts",
+ "toml",
+]
 
 [[package]]
 name = "strsim"
@@ -3945,6 +3974,15 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+]
+
+[[package]]
+name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
