@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bao_tree::{ChunkNum, ChunkRanges, blake3, io::BaoContentItem};
 use clap::Parser;
-use iroh::{Endpoint, NodeId, Watcher, discovery::static_provider::StaticProvider, endpoint};
+use iroh::{NodeId, Watcher, discovery::static_provider::StaticProvider, endpoint};
 use iroh_blobs::{
     BlobFormat, BlobsProtocol, Hash,
     get::{
@@ -53,11 +53,13 @@ async fn main() -> Result<()> {
             };
             endpoint.home_relay().initialized().await;
             let addr = endpoint.node_addr().initialized().await;
+            let node_id = addr.node_id;
             let proto = BlobsProtocol::new(&store, endpoint.clone(), None);
             let router = iroh::protocol::Router::builder(endpoint.clone())
                 .accept(iroh_blobs::ALPN, proto.clone())
                 .spawn();
             let ticket = BlobTicket::new(addr, tag.hash, BlobFormat::Raw);
+            println!("Node id: {node_id}");
             println!("Providing content with ticket:\n{ticket}");
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
@@ -80,17 +82,13 @@ async fn main() -> Result<()> {
 /// We get the size just so we have timings, then get the latency from the
 /// endpoint.
 async fn get_latency_and_size(
-    endpoint: &Endpoint,
     pool: &ConnectionPool,
     node_id: &NodeId,
     hash: &Hash,
 ) -> Result<(Duration, u64)> {
     let conn = pool.get_or_connect(*node_id).await?;
-    let (size, _stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
-    let latency = endpoint
-        .remote_info(*node_id)
-        .and_then(|info| info.latency)
-        .context("No latency information available")?;
+    let (size, stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
+    let latency = stats.elapsed;
     Ok((latency, size))
 }
 
@@ -100,16 +98,14 @@ async fn get_latency_and_size(
 /// immediately filter out nodes that are not reachable.
 async fn get_latencies_and_sizes(
     infos: &HashMap<NodeId, Hash>,
-    endpoint: &Endpoint,
     pool: &ConnectionPool,
     parallelism: usize,
 ) -> HashMap<NodeId, Result<(Duration, u64)>> {
     stream::iter(infos.iter().clone())
         .map(|(id, hash)| {
             let pool = pool.clone();
-            let endpoint = endpoint.clone();
             async move {
-                match get_latency_and_size(&endpoint, &pool, id, hash).await {
+                match get_latency_and_size(&pool, id, hash).await {
                     Ok((latency, size)) => (*id, Ok((latency, size))),
                     Err(e) => (*id, Err(e)),
                 }
@@ -152,7 +148,7 @@ async fn sync(
     // create a connection pool
     let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, Default::default());
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &endpoint, &pool, 32).await;
+    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, 32).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
