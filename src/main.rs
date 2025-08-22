@@ -27,7 +27,7 @@ use n0_future::{BufferedStreamExt, FuturesUnordered, StreamExt, future::Boxed, s
 use rand::RngCore;
 use range_collections::range_set::RangeSetRange;
 use tokio::sync::oneshot;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -550,13 +550,19 @@ impl Downloader {
         let success = matches!(result, Some(Ok(_)));
         if !success {
             // add back unclaimed ranges since the download failed
-            let target = self.ctx.target.lock().unwrap();
-            self.unclaimed |= ranges & target.missing.clone();
-            if result.is_some() {
+            if let Some(Err(e)) = result {
+                warn!(
+                    "Download from {} failed for ranges {:?}: {}",
+                    id.fmt_short(),
+                    ranges,
+                    e
+                );
                 // only increase error count if there was an actual error.
                 // when we kill the task that is not the fault of the remote node.
                 stats.errors += 1;
             }
+            let target = self.ctx.target.lock().unwrap();
+            self.unclaimed |= ranges & target.missing.clone();
         }
     }
 
