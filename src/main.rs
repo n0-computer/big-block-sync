@@ -175,7 +175,7 @@ async fn sync(tickets: Vec<BlobTicket>, target: Option<PathBuf>, block_size_chun
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let downloader = Downloader::new(hashes, size, block_size, pool, &latency, parallelism);
+    let downloader = Downloader::new(hashes, size, pool, &latency, block_size, parallelism);
     let (res, stats) = downloader
         .run()
         .await
@@ -437,13 +437,22 @@ fn print_bitfields(stats: &HashMap<NodeId, PerNodeStats>, size: usize) {
 }
 
 struct Downloader {
+    /// Contect needed for the per-node tasks
     ctx: Arc<Ctx>,
+    /// Futures for currently active downloads
     tasks: FuturesUnordered<Boxed<(NodeId, ChunkRanges, Option<anyhow::Result<()>>)>>,
+    /// Unclaimed chunks that are not yet assigned to any download
     unclaimed: ChunkRanges,
+    /// Mapping from node id to hash, to know what do download
     hashes: HashMap<NodeId, Hash>,
+    /// Per node statistics. Note that this will also be filled for nodes we never
+    /// talked to, using the initial latency.
     stats: HashMap<NodeId, PerNodeStats>,
+    /// Kill handles for currently active downloads
     current: HashMap<NodeId, oneshot::Sender<()>>,
+    /// Block size for downloads
     block_size: ChunkNum,
+    /// Maximum number of concurrent downloads
     parallelism: usize,
 }
 
@@ -451,9 +460,9 @@ impl Downloader {
     fn new(
         hashes: HashMap<NodeId, Hash>,
         size: usize,
-        block_size: ChunkNum,
         pool: ConnectionPool,
         latency: &HashMap<NodeId, Duration>,
+        block_size: ChunkNum,
         parallelism: usize,
     ) -> Self {
         let target = Target::new(size);
@@ -485,6 +494,7 @@ impl Downloader {
     }
 
     /// Best n nodes, free or busy (for quality, lower is better)
+    #[allow(dead_code)]
     fn all_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
         let mut qualities: Vec<_> = self
             .stats
