@@ -696,7 +696,15 @@ impl Ctx {
         cancel: oneshot::Receiver<()>,
     ) -> (NodeId, ChunkRanges, Option<anyhow::Result<()>>) {
         let result = tokio::select! {
-            res = self.download_range_impl(id, hash, ranges.clone()) => Some(res),
+            res = self.download_range_impl(id, hash, ranges.clone()) => {
+                if res.is_err() {
+                    // tell the pool that there was an error and this connection is bad.
+                    // todo: we should only do this if it was a connection error, not a
+                    // blobs error, maybe?
+                    self.pool.close(id).await.ok();
+                }
+                Some(res)
+            },
             _ = cancel => None,
         };
         (id, ranges.clone(), result)
