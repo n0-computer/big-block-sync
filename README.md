@@ -1,5 +1,7 @@
 # Sync from multiple sources with different hash
 
+**🧪 Experimental**
+
 ## Provide side
 
 This is just a vanilla iroh-blobs blobs provide, just so the cli is self-contained.
