@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use anyhow::{Context, Result, bail};
 use bao_tree::blake3;
-use big_block_sync::sync;
+use big_block_sync::{print_bitfields, print_stats, sync};
 use clap::Parser;
 use iroh::{SecretKey, Watcher, endpoint};
 use iroh_blobs::{BlobFormat, BlobsProtocol, ticket::BlobTicket};
@@ -154,8 +154,13 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .map(|t| (t.node_addr().clone(), t.hash()))
                 .collect::<Vec<_>>();
-            let res = sync(blobs, block_size, verbose, parallelism).await?;
-
+            let (res, stats) = sync(blobs, block_size, verbose, parallelism).await?;
+            if verbose > 0 {
+                print_stats(&stats);
+            }
+            if verbose > 1 {
+                print_bitfields(&stats, res.len());
+            }
             if let Some(target) = target {
                 tokio::fs::write(target, res)
                     .await

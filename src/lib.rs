@@ -67,7 +67,7 @@ pub async fn sync(
     block_size_chunks: u64,
     verbose: u8,
     parallelism: usize,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
     let block_size = ChunkNum(block_size_chunks);
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = blobs
@@ -128,13 +128,7 @@ pub async fn sync(
         .run()
         .await
         .context("Failed to download content")?;
-    if verbose > 0 {
-        print_stats(&stats);
-    }
-    if verbose > 1 {
-        print_bitfields(&stats, size);
-    }
-    Ok(res)
+    Ok((res, stats))
 }
 
 fn total_chunks(ranges: &ChunkRanges) -> Option<ChunkNum> {
@@ -185,7 +179,7 @@ struct Target {
 }
 
 #[derive(Debug, Default)]
-struct PerNodeStats {
+pub struct PerNodeStats {
     // total downloaded chunks from this node
     ranges: ChunkRanges,
     // error count
@@ -300,7 +294,8 @@ fn test_quality_ordering() {
 
     assert_eq!(qualities, expected);
 }
-fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
+
+pub fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
     println!("Node       Errors\tChunks\tDuration\tRate");
     for (id, stat) in stats {
         let total = stat.total_chunks().unwrap_or_default();
@@ -365,7 +360,7 @@ fn print_bitfield(bitfield: &ChunkRanges, size: usize) -> String {
         .collect()
 }
 
-fn print_bitfields(stats: &HashMap<NodeId, PerNodeStats>, size: usize) {
+pub fn print_bitfields(stats: &HashMap<NodeId, PerNodeStats>, size: usize) {
     println!("Node       Bitfield");
     for (id, stat) in stats {
         let bitfield_str = print_bitfield(&stat.ranges, size);
