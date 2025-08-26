@@ -1,5 +1,5 @@
 use std::{
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     collections::HashMap,
     ops::DerefMut,
     sync::{Arc, Mutex},
@@ -250,6 +250,57 @@ impl Quality {
     fn rate(&self) -> Option<u64> {
         self.rate.0
     }
+
+    /// Compare with a minimum rate.
+    ///
+    /// Compard to the Ord impl, qualities below the minimum rate will
+    /// sort higher (worse) than qualities for which we don't have any rate.
+    ///
+    /// This gives nodes we have not yet used a chance to win against slow nodes
+    /// we have already used.
+    fn compare(&self, that: &Quality, min_rate: u64) -> Ordering {
+        // Bail out early if errors differ (lower is better)
+        if self.errors != that.errors {
+            return self.errors.cmp(&that.errors);
+        }
+
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Tier {
+            Fast,    // Best
+            Unknown, // Middle
+            Slow,    // Worst
+        }
+
+        let get_tier = |rate: Option<u64>| match rate {
+            Some(r) if r >= min_rate => Tier::Fast,
+            None => Tier::Unknown,
+            Some(_) => Tier::Slow,
+        };
+
+        let self_tier = get_tier(self.rate());
+        let that_tier = get_tier(that.rate());
+
+        // Fast will win against unknown, but unknown will win against slow!
+        match self_tier.cmp(&that_tier) {
+            Ordering::Equal => {} // Continue to tie-breaking
+            other => return other,
+        }
+
+        match self_tier {
+            // both fast, latency is just tie breaker in the unlikely case of identical rate.
+            Tier::Fast => that
+                .rate()
+                .cmp(&self.rate())
+                .then(self.latency.cmp(&that.latency)),
+            // both unknown, use latency
+            Tier::Unknown => self.latency.cmp(&that.latency),
+            // both slow, latency is just tie breaker in the unlikely case of identical rate.
+            Tier::Slow => that
+                .rate()
+                .cmp(&self.rate())
+                .then(self.latency.cmp(&that.latency)),
+        }
+    }
 }
 
 impl std::fmt::Display for Quality {
@@ -299,6 +350,54 @@ fn test_quality_ordering() {
     ];
 
     assert_eq!(qualities, expected);
+}
+#[test]
+fn test_sorting_with_min_rate() {
+    let min_rate = 50;
+    let z_25_100 = Quality::new(0, Some(25.0), Duration::from_millis(100));
+    let z_100_50 = Quality::new(0, Some(100.0), Duration::from_millis(50));
+    let z_none_30 = Quality::new(0, None, Duration::from_millis(30));
+    let z_75_80 = Quality::new(0, Some(75.0), Duration::from_millis(80));
+    let z_50_60 = Quality::new(0, Some(50.0), Duration::from_millis(60));
+    let z_100_40 = Quality::new(0, Some(100.0), Duration::from_millis(40));
+    let e_200_10 = Quality::new(1, Some(200.0), Duration::from_millis(10));
+
+    // Additional test cases for tie breakers
+    let z_none_50 = Quality::new(0, None, Duration::from_millis(50)); // Unknown tier, different latency
+    let z_30_90 = Quality::new(0, Some(30.0), Duration::from_millis(90)); // Slow tier, different rate/latency
+    let z_25_80 = Quality::new(0, Some(25.0), Duration::from_millis(80)); // Slow tier, same rate as z_25_100 but lower latency
+    let z_150_70 = Quality::new(0, Some(150.0), Duration::from_millis(70)); // Fast tier, different rate
+    let z_100_45 = Quality::new(0, Some(100.0), Duration::from_millis(45)); // Fast tier, same rate as z_100_40/z_100_50 but middle latency
+
+    let mut qualities = vec![
+        z_25_100, z_100_50, z_none_30, z_75_80, z_50_60, z_100_40, e_200_10, z_none_50, z_30_90,
+        z_25_80, z_150_70, z_100_45,
+    ];
+
+    qualities.sort_by(|a, b| a.compare(b, min_rate));
+
+    // Expected order:
+    // 1. Fast connections (rate >= 50): higher rate first, then lower latency
+    // 2. Unknown connections: lower latency first
+    // 3. Slow connections (rate < 50): higher rate first, then lower latency
+    // 4. High error connections last
+
+    let expected_order = vec![
+        z_150_70,  // Fast: rate 150, latency 70
+        z_100_40,  // Fast: rate 100, latency 40
+        z_100_45,  // Fast: rate 100, latency 45
+        z_100_50,  // Fast: rate 100, latency 50
+        z_75_80,   // Fast: rate 75, latency 80
+        z_50_60,   // Fast: rate 50, latency 60
+        z_none_30, // Unknown: latency 30
+        z_none_50, // Unknown: latency 50
+        z_30_90,   // Slow: rate 30, latency 90
+        z_25_80,   // Slow: rate 25, latency 80
+        z_25_100,  // Slow: rate 25, latency 100
+        e_200_10,  // Error connections always last regardless of rate/latency
+    ];
+
+    assert_eq!(qualities, expected_order);
 }
 
 pub fn print_stats(stats: &HashMap<NodeId, PerNodeStats>) {
