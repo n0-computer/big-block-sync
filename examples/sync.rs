@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use anyhow::{Context, Result, bail};
 use bao_tree::blake3;
-use big_block_sync::{print_bitfields, print_stats, sync};
+use big_block_sync::{Config, print_bitfields, print_stats, sync};
 use clap::Parser;
 use iroh::{SecretKey, Watcher, endpoint};
 use iroh_blobs::{BlobFormat, BlobsProtocol, ticket::BlobTicket};
@@ -154,7 +154,11 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .map(|t| (t.node_addr().clone(), t.hash()))
                 .collect::<Vec<_>>();
-            let (res, stats) = sync(blobs, block_size, verbose, parallelism).await?;
+            let config = Config {
+                parallelism,
+                block_size,
+            };
+            let (res, stats) = sync(blobs, config, verbose).await?;
             if verbose > 0 {
                 print_stats(&stats);
             }

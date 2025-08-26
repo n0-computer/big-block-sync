@@ -62,13 +62,19 @@ async fn get_latencies_and_sizes(
         .await
 }
 
+pub struct Config {
+    /// Block size in BLAKE3 chunks
+    pub block_size: u64,
+    /// Parallelism level for the sync algorithm
+    pub parallelism: usize,
+}
+
 pub async fn sync(
     blobs: Vec<(NodeAddr, Hash)>,
-    block_size_chunks: u64,
+    config: Config,
     verbose: u8,
-    parallelism: usize,
 ) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
-    let block_size = ChunkNum(block_size_chunks);
+    let block_size = ChunkNum(config.block_size);
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = blobs
         .iter()
@@ -93,7 +99,7 @@ pub async fn sync(
     // create a connection pool
     let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, Default::default());
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, 32).await;
+    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, config.parallelism).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
@@ -123,7 +129,7 @@ pub async fn sync(
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let downloader = Downloader::new(hashes, size, pool, &latency, block_size, parallelism);
+    let downloader = Downloader::new(hashes, size, pool, &latency, block_size, config.parallelism);
     let (res, stats) = downloader
         .run()
         .await
