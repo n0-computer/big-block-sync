@@ -2,14 +2,13 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     ops::DerefMut,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use bao_tree::{ChunkNum, ChunkRanges, blake3, io::BaoContentItem};
-use iroh::{NodeId, discovery::static_provider::StaticProvider, endpoint};
+use bao_tree::{ChunkNum, ChunkRanges, io::BaoContentItem};
+use iroh::{NodeAddr, NodeId, discovery::static_provider::StaticProvider, endpoint};
 use iroh_blobs::{
     Hash,
     get::{
@@ -17,7 +16,6 @@ use iroh_blobs::{
         fsm::{BlobContentNext, ConnectedNext, EndBlobNext},
     },
     protocol::{ChunkRangesExt, GetRequest},
-    ticket::BlobTicket,
     util::connection_pool::ConnectionPool,
 };
 use n0_future::{BufferedStreamExt, FuturesUnordered, StreamExt, future::Boxed, stream};
@@ -65,23 +63,22 @@ async fn get_latencies_and_sizes(
 }
 
 pub async fn sync(
-    tickets: Vec<BlobTicket>,
-    target: Option<PathBuf>,
+    blobs: Vec<(NodeAddr, Hash)>,
     block_size_chunks: u64,
     verbose: u8,
     parallelism: usize,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let block_size = ChunkNum(block_size_chunks);
     // if there are multiple hashes for one node id, we will just choose the last one!
-    let hashes = tickets
+    let hashes = blobs
         .iter()
-        .map(|t| (t.node_addr().node_id, t.hash()))
+        .map(|(addr, hash)| (addr.node_id, *hash))
         .collect::<HashMap<_, _>>();
     // we take all addr info. If there are multiple, they will be combined except for
     // the relay url, which will be the last one.
-    let addrs = tickets
+    let addrs = blobs
         .iter()
-        .map(|t| t.node_addr().clone())
+        .map(|(addr, _)| addr.clone())
         .collect::<Vec<_>>();
     // give the endpoint the info it needs to dial all nodes.
     //
@@ -137,18 +134,7 @@ pub async fn sync(
     if verbose > 1 {
         print_bitfields(&stats, size);
     }
-    if let Some(target) = target {
-        tokio::fs::write(target, res)
-            .await
-            .context("Failed to write content to target file")?;
-    } else {
-        println!(
-            "Downloaded content: {} bytes, hash {}",
-            res.len(),
-            blake3::hash(&res)
-        );
-    }
-    Ok(())
+    Ok(res)
 }
 
 fn total_chunks(ranges: &ChunkRanges) -> Option<ChunkNum> {

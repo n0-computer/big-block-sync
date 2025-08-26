@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use bao_tree::blake3;
 use big_block_sync::sync;
 use clap::Parser;
 use iroh::{SecretKey, Watcher, endpoint};
@@ -149,7 +150,23 @@ async fn main() -> Result<()> {
             block_size,
             parallelism,
         } => {
-            sync(tickets, target, block_size, verbose, parallelism).await?;
+            let blobs = tickets
+                .into_iter()
+                .map(|t| (t.node_addr().clone(), t.hash()))
+                .collect::<Vec<_>>();
+            let res = sync(blobs, block_size, verbose, parallelism).await?;
+
+            if let Some(target) = target {
+                tokio::fs::write(target, res)
+                    .await
+                    .context("Failed to write content to target file")?;
+            } else {
+                println!(
+                    "Downloaded content: {} bytes, hash {}",
+                    res.len(),
+                    blake3::hash(&res)
+                );
+            }
         }
     }
     Ok(())
