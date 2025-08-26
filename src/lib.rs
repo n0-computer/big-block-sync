@@ -9,10 +9,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bao_tree::{ChunkNum, ChunkRanges, blake3, io::BaoContentItem};
-use clap::Parser;
-use iroh::{NodeId, Watcher, discovery::static_provider::StaticProvider, endpoint};
+use iroh::{NodeId, discovery::static_provider::StaticProvider, endpoint};
 use iroh_blobs::{
-    BlobFormat, BlobsProtocol, Hash,
+    Hash,
     get::{
         self,
         fsm::{BlobContentNext, ConnectedNext, EndBlobNext},
@@ -21,61 +20,10 @@ use iroh_blobs::{
     ticket::BlobTicket,
     util::connection_pool::ConnectionPool,
 };
-mod common;
-use common::{get_or_generate_secret_key, setup_logging};
 use n0_future::{BufferedStreamExt, FuturesUnordered, StreamExt, future::Boxed, stream};
-use rand::RngCore;
 use range_collections::range_set::RangeSetRange;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    setup_logging();
-    let args = cli::Args::parse();
-    match args.command {
-        cli::Commands::Provide { path, n } => {
-            let secret = get_or_generate_secret_key()?;
-            let store = iroh_blobs::store::mem::MemStore::new();
-            let endpoint = endpoint::Endpoint::builder()
-                .secret_key(secret)
-                .bind()
-                .await?;
-            let tag = if let Some(path) = path {
-                store.add_path(path).await?
-            } else if let Some(n) = n {
-                let mut rng = rand::thread_rng();
-                let mut data = vec![0u8; n];
-                rng.fill_bytes(&mut data);
-                store.add_bytes(data).await?
-            } else {
-                bail!("No path or size provided");
-            };
-            endpoint.home_relay().initialized().await;
-            let addr = endpoint.node_addr().initialized().await;
-            let node_id = addr.node_id;
-            let proto = BlobsProtocol::new(&store, endpoint.clone(), None);
-            let router = iroh::protocol::Router::builder(endpoint.clone())
-                .accept(iroh_blobs::ALPN, proto.clone())
-                .spawn();
-            let ticket = BlobTicket::new(addr, tag.hash, BlobFormat::Raw);
-            println!("Node id: {node_id}");
-            println!("Providing content with ticket:\n{ticket}");
-            tokio::signal::ctrl_c().await?;
-            router.shutdown().await?;
-        }
-        cli::Commands::Sync {
-            tickets,
-            target,
-            verbose,
-            block_size,
-            parallelism,
-        } => {
-            sync(tickets, target, block_size, verbose, parallelism).await?;
-        }
-    }
-    Ok(())
-}
 
 /// Get latency and size for a single hash
 ///
@@ -116,7 +64,7 @@ async fn get_latencies_and_sizes(
         .await
 }
 
-async fn sync(
+pub async fn sync(
     tickets: Vec<BlobTicket>,
     target: Option<PathBuf>,
     block_size_chunks: u64,
@@ -754,74 +702,5 @@ impl Target {
             data: vec![0; size],
             missing: ChunkRanges::bytes(0..size as u64),
         }
-    }
-}
-
-mod cli {
-    use std::path::PathBuf;
-
-    use clap::{Parser, Subcommand};
-    use iroh_blobs::ticket::BlobTicket;
-
-    #[derive(Debug, Parser)]
-    #[command(version, about)]
-    pub struct Args {
-        #[clap(subcommand)]
-        pub command: Commands,
-    }
-
-    #[derive(Subcommand, Clone, Debug)]
-    pub enum Commands {
-        /// Launch an iroh node and provide the content at the given path
-        ///
-        /// This is just a standard iroh-blobs provide, it is only in the
-        /// example so the example is self-contained.
-        #[group(required = true, multiple = false)]
-        Provide {
-            /// path to the file you want to provide.
-            path: Option<PathBuf>,
-
-            /// Size in bytes, data will be randomly generated
-            #[arg(long, short)]
-            n: Option<usize>,
-        },
-        /// Syncs a blob from multiple sources, given as tickets.
-        ///
-        /// As opposed to other examples, the blobs must not have the same hash!
-        /// They just must have the same size. The resulting file will be
-        /// built out of ranges of the source blobs, but will not necessarily
-        /// have the same hash as any of the input blobs unless there is only
-        /// one provider.
-        ///
-        /// Syncing does not accept connections, it is a pure client.
-        Sync {
-            tickets: Vec<BlobTicket>,
-
-            /// Path to the file where the synced content will be saved
-            #[clap(long)]
-            target: Option<PathBuf>,
-
-            /// Verbosity level
-            ///
-            /// 1 will show stats,
-            /// 2 will show stats and bitfields
-            #[arg(short, long, action = clap::ArgAction::Count)]
-            verbose: u8,
-
-            /// Block size in BLAKE3 chunks of 1024 bytes.
-            ///
-            /// Making this too large will reduce adaptation rate.
-            ///
-            /// if size / (block_size * 1024) is larger than the number of
-            /// nodes to download from, you will get reduced parallelism.
-            #[arg(long, default_value_t = 1024)]
-            block_size: u64,
-
-            /// Parallelism level. Even when many nodes are provided, the
-            /// downloader will not use all of them concurrently but will try
-            /// to choose the best ones.
-            #[arg(long, default_value_t = 8)]
-            parallelism: usize,
-        },
     }
 }
