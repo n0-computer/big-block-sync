@@ -23,6 +23,9 @@ use range_collections::range_set::RangeSetRange;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+#[cfg(test)]
+mod tests;
+
 /// Get latency and size for a single hash
 ///
 /// We get the size just so we have timings, then get the latency from the
@@ -31,10 +34,15 @@ async fn get_latency_and_size(
     pool: &ConnectionPool,
     node_id: &NodeId,
     hash: &Hash,
+    config: &Config,
 ) -> Result<(Duration, u64)> {
     let conn = pool.get_or_connect(*node_id).await?;
     let (size, _stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
-    let latency = conn.rtt();
+    let latency = config
+        .latency
+        .get(node_id)
+        .cloned()
+        .unwrap_or_else(|| conn.rtt());
     Ok((latency, size))
 }
 
@@ -45,19 +53,19 @@ async fn get_latency_and_size(
 async fn get_latencies_and_sizes(
     infos: &HashMap<NodeId, Hash>,
     pool: &ConnectionPool,
-    parallelism: usize,
+    config: &Config,
 ) -> HashMap<NodeId, Result<(Duration, u64)>> {
     stream::iter(infos.iter().clone())
         .map(|(id, hash)| {
             let pool = pool.clone();
             async move {
-                match get_latency_and_size(&pool, id, hash).await {
+                match get_latency_and_size(&pool, id, hash, config).await {
                     Ok((latency, size)) => (*id, Ok((latency, size))),
                     Err(e) => (*id, Err(e)),
                 }
             }
         })
-        .buffered_unordered(parallelism)
+        .buffered_unordered(config.parallelism)
         .collect::<HashMap<_, _>>()
         .await
 }
@@ -67,6 +75,35 @@ pub struct Config {
     pub block_size: u64,
     /// Parallelism level for the sync algorithm
     pub parallelism: usize,
+    /// Minimum rate in bytes/sec to consider a node fast.
+    ///
+    /// If a node is slower than this, we will try different nodes for which
+    /// we don't have any speed information.
+    pub min_rate: Option<u64>,
+    /// Acceptable ratio between current providers.
+    ///
+    /// If a provider in the current set has less than 1/ratio of the fastest provider,
+    /// we will try out a provider we have not used yet.
+    pub rate_ratio: Option<u64>,
+    /// A way to override the latency measurement. The default is just connection.rtt().
+    /// This is useful if you have prior knowledge of good nodes, or if you want different
+    /// latencies for tests.
+    pub latency: HashMap<NodeId, Duration>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            block_size: 1024, // 1MiB
+            parallelism: 4,
+            // no min rate
+            min_rate: None,
+            // no rate ratio
+            rate_ratio: None,
+            // no initial latencies
+            latency: Default::default(),
+        }
+    }
 }
 
 pub async fn sync(
@@ -74,7 +111,6 @@ pub async fn sync(
     config: Config,
     verbose: u8,
 ) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
-    let block_size = ChunkNum(config.block_size);
     // if there are multiple hashes for one node id, we will just choose the last one!
     let hashes = blobs
         .iter()
@@ -99,7 +135,7 @@ pub async fn sync(
     // create a connection pool
     let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, Default::default());
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, config.parallelism).await;
+    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, &config).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
@@ -112,13 +148,13 @@ pub async fn sync(
         bail!("All nodes must have the same size, but got: {:?}", sizes);
     }
     // Latency can be used as an initial hint which nodes are good
-    let latency = latencies_and_sizes
+    let latencies = latencies_and_sizes
         .iter()
         .filter_map(|(id, res)| res.as_ref().ok().map(|(l, _)| (*id, *l)))
         .collect::<HashMap<_, _>>();
     if verbose > 0 {
         println!("Node       Initial Latency (ms)");
-        for (id, l) in &latency {
+        for (id, l) in &latencies {
             println!("{} {:<8.3}ms", id.fmt_short(), l.as_secs_f64() * 1000.0);
         }
     }
@@ -129,7 +165,7 @@ pub async fn sync(
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let downloader = Downloader::new(hashes, size, pool, &latency, block_size, config.parallelism);
+    let downloader = Downloader::new(hashes, size, pool, &latencies, config);
     let (res, stats) = downloader
         .run()
         .await
@@ -258,7 +294,12 @@ impl Quality {
     ///
     /// This gives nodes we have not yet used a chance to win against slow nodes
     /// we have already used.
-    fn compare(&self, that: &Quality, min_rate: u64) -> Ordering {
+    fn compare(&self, that: &Quality, min_rate: Option<u64>) -> Ordering {
+        let Some(min_rate) = min_rate else {
+            // if min_rate is not set, it should just use the default ordering.
+            return self.cmp(that);
+        };
+
         // Bail out early if errors differ (lower is better)
         if self.errors != that.errors {
             return self.errors.cmp(&that.errors);
@@ -374,7 +415,7 @@ fn test_sorting_with_min_rate() {
         z_25_80, z_150_70, z_100_45,
     ];
 
-    qualities.sort_by(|a, b| a.compare(b, min_rate));
+    qualities.sort_by(|a, b| a.compare(b, Some(min_rate)));
 
     // Expected order:
     // 1. Fast connections (rate >= 50): higher rate first, then lower latency
@@ -487,10 +528,8 @@ struct Downloader {
     stats: HashMap<NodeId, PerNodeStats>,
     /// Kill handles for currently active downloads
     current: HashMap<NodeId, oneshot::Sender<()>>,
-    /// Block size for downloads
-    block_size: ChunkNum,
-    /// Maximum number of concurrent downloads
-    parallelism: usize,
+    /// config
+    config: Config,
 }
 
 impl Downloader {
@@ -499,8 +538,7 @@ impl Downloader {
         size: usize,
         pool: ConnectionPool,
         latency: &HashMap<NodeId, Duration>,
-        block_size: ChunkNum,
-        parallelism: usize,
+        config: Config,
     ) -> Self {
         let target = Target::new(size);
         let unclaimed = target.missing.clone();
@@ -525,22 +563,32 @@ impl Downloader {
                     )
                 })
                 .collect(),
-            block_size,
-            parallelism,
+            config,
         }
     }
 
-    /// Best n nodes, free or busy (for quality, lower is better)
-    #[allow(dead_code)]
-    fn all_by_quality(&self, n: usize) -> Vec<(Quality, NodeId)> {
-        let mut qualities: Vec<_> = self
-            .stats
-            .iter()
-            .map(|(id, stat)| (stat.quality(), *id))
-            .collect();
-        qualities.sort();
-        qualities.truncate(n);
-        qualities
+    /// Minimum rate to be considered acceptable.
+    ///
+    /// The result is the maximum of the configured min_rate and the
+    /// observed_max_rate divided by config.rate_ratio.
+    fn min_rate(&self) -> Option<u64> {
+        let config_min_rate = self.config.min_rate;
+        let observerd_min_rate = self
+            .config
+            .rate_ratio
+            .and_then(|ratio| Some(self.observed_max_rate()? / ratio));
+        let res = config_min_rate.max(observerd_min_rate);
+        println!("min_rate: {:?}", res);
+        res
+    }
+
+    /// Highest rate of all providers we have used
+    fn observed_max_rate(&self) -> Option<u64> {
+        // todo: should we exclude all but the providers with the lowest error count?
+        self.stats
+            .values()
+            .filter_map(|s| s.rate().map(|x| x as u64))
+            .max()
     }
 
     /// Give the first n free nodes by quality (for quality, lower is better)
@@ -551,24 +599,32 @@ impl Downloader {
             .filter(|(id, _)| !self.current.contains_key(*id))
             .map(|(id, stat)| (stat.quality(), *id))
             .collect();
-        qualities.sort();
-        qualities.truncate(n);
-        qualities
+        let min_rate = self.min_rate();
+        qualities.sort_by(|(aq, ak), (bq, bk)| aq.compare(bq, min_rate).then(ak.cmp(bk)));
+        let q = qualities
+            .iter()
+            .map(|x| (x.0.rate(), x.0.latency))
+            .collect::<Vec<_>>();
+        println!("Free nodes by quality: {:?}", q);
+        first_n(qualities, n, |(aq, ak), (bq, bk)| {
+            aq.compare(bq, min_rate).then(ak.cmp(bk))
+        })
     }
 
     /// Give the first n busy nodes by reverse quality (higher, so worse, qualities first)
     ///
     /// The worst node should come first.
     fn busy_by_quality_rev(&self, n: usize) -> Vec<(Quality, NodeId)> {
-        let mut qualities: Vec<_> = self
+        let qualities: Vec<_> = self
             .stats
             .iter()
             .filter(|(id, _)| self.current.contains_key(*id))
             .map(|(id, stat)| (stat.quality(), *id))
             .collect();
-        qualities.sort_by(|a, b| b.cmp(a));
-        qualities.truncate(n);
-        qualities
+        let min_rate = self.min_rate();
+        first_n(qualities, n, |(aq, ak), (bq, bk)| {
+            aq.compare(bq, min_rate).then(ak.cmp(bk)).reverse()
+        })
     }
 
     /// Update state based on task result
@@ -608,7 +664,7 @@ impl Downloader {
     /// The latter will only happen as the download nears the end, so it is called
     /// finish mode.
     async fn claim_and_spawn(&mut self) -> Result<()> {
-        let chunk_size = self.block_size;
+        let chunk_size = ChunkNum(self.config.block_size);
         let claim = claim(&self.unclaimed, chunk_size);
         if !claim.is_empty() {
             // choose the best node to download from. In many cases this will be the same node
@@ -670,8 +726,8 @@ impl Downloader {
     }
 
     async fn run(mut self) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
-        let chunk_size = self.block_size;
-        let initial = self.free_by_quality(self.parallelism);
+        let chunk_size = ChunkNum(self.config.block_size);
+        let initial = self.free_by_quality(self.config.parallelism);
         for (_, id) in initial {
             let claim = claim(&self.unclaimed, chunk_size);
             if claim.is_empty() {
@@ -789,4 +845,20 @@ impl Target {
             missing: ChunkRanges::bytes(0..size as u64),
         }
     }
+}
+
+fn first_n<T, F>(mut data: Vec<T>, n: usize, cmp: F) -> Vec<T>
+where
+    F: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    if n == 0 {
+        data.clear();
+    } else if data.len() > n {
+        data.select_nth_unstable_by(n - 1, &cmp);
+        data.truncate(n);
+        data[..n - 1].sort_unstable_by(&cmp);
+    } else {
+        data.sort_unstable_by(&cmp);
+    }
+    data
 }

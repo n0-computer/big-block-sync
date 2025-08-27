@@ -157,6 +157,9 @@ async fn main() -> Result<()> {
             let config = Config {
                 parallelism,
                 block_size,
+                min_rate: None,
+                rate_ratio: None,
+                latency: Default::default(),
             };
             let (res, stats) = sync(blobs, config, verbose).await?;
             if verbose > 0 {
