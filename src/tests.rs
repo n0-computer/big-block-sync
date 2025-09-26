@@ -107,6 +107,33 @@ async fn smoke() -> TestResult<()> {
     Ok(())
 }
 
+/// Just performs a download from 8 possible sources and checks that
+/// 1. The download is successful
+/// 2. The downloaded data is complete
+/// 3. config.parallelism sources are used
+#[tokio::test]
+async fn smoke_in_task() -> TestResult<()> {
+    tokio::spawn(async {
+        let size = 1024 * 1024;
+        let (routers, blobs) = create_providers(8, size, Vec::new()).await?;
+        let config = Config {
+            parallelism: 4,
+            block_size: 64, // 64 KiB
+            min_rate: None,
+            rate_ratio: None,
+            latency: Default::default(),
+        };
+        let (res, stats) = sync(blobs, config, 0).await?;
+        assert_eq!(res.len(), size);
+        assert!(res.iter().all(|b| *b != 0));
+        // check that 4 providers are actually used for downloads.
+        assert_eq!(used_providers(&stats), 4);
+        shutdown_routers(routers).await;
+        TestResult::Ok(())
+    }).await??;
+    Ok(())
+}
+
 /// Just performs a download from 8 possible sources with an unrealistically high min_rate and checks that
 /// 1. The download is successful
 /// 2. The downloaded data is complete

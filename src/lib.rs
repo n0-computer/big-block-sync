@@ -31,7 +31,7 @@ mod tests;
 /// We get the size just so we have timings, then get the latency from the
 /// endpoint.
 async fn get_latency_and_size(
-    pool: Arc<ConnectionPool>,
+    pool: &ConnectionPool,
     node_id: NodeId,
     hash: &Hash,
     config: &Config,
@@ -51,8 +51,8 @@ async fn get_latency_and_size(
 /// This gives us some initial estimate of the connection quality and also will
 /// immediately filter out nodes that are not reachable.
 async fn get_latencies_and_sizes(
-    infos: Arc<HashMap<NodeId, Hash>>,
-    pool: Arc<ConnectionPool>,
+    infos: &HashMap<NodeId, Hash>,
+    pool: &ConnectionPool,
     config: &Config,
 ) -> HashMap<NodeId, Result<(Duration, u64)>> {
     let copy = infos
@@ -61,7 +61,6 @@ async fn get_latencies_and_sizes(
         .collect::<Vec<_>>();
     stream::iter(copy.into_iter())
         .map(|(id, hash)| {
-            let pool = pool.clone();
             async move {
                 match get_latency_and_size(pool, id, &hash, config).await {
                     Ok((latency, size)) => (id, Ok((latency, size))),
@@ -116,12 +115,11 @@ pub async fn sync(
     verbose: u8,
 ) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
     // if there are multiple hashes for one node id, we will just choose the last one!
-    let hashes = Arc::new(
+    let hashes = 
         blobs
             .iter()
             .map(|(addr, hash)| (addr.node_id, *hash))
-            .collect::<HashMap<_, _>>(),
-    );
+            .collect::<HashMap<_, _>>();
     // we take all addr info. If there are multiple, they will be combined except for
     // the relay url, which will be the last one.
     let addrs = blobs
@@ -139,13 +137,13 @@ pub async fn sync(
         .bind()
         .await?;
     // create a connection pool
-    let pool = Arc::new(ConnectionPool::new(
+    let pool = ConnectionPool::new(
         endpoint.clone(),
         iroh_blobs::ALPN,
         Default::default(),
-    ));
+    );
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(hashes.clone(), pool.clone(), &config).await;
+    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, &config).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
@@ -175,7 +173,7 @@ pub async fn sync(
         }
     }
     let size = usize::try_from(size).context("Size is too large to fit into a usize")?;
-    let downloader = Downloader::new(hashes, size, pool, &latencies, config);
+    let downloader = Downloader::new(hashes, size, &pool, &latencies, config);
     let (res, stats) = downloader
         .run()
         .await
@@ -532,7 +530,7 @@ struct Downloader {
     /// Unclaimed chunks that are not yet assigned to any download
     unclaimed: ChunkRanges,
     /// Mapping from node id to hash, to know what do download
-    hashes: Arc<HashMap<NodeId, Hash>>,
+    hashes: HashMap<NodeId, Hash>,
     /// Per node statistics. Note that this will also be filled for nodes we never
     /// talked to, using the initial latency.
     stats: HashMap<NodeId, PerNodeStats>,
@@ -544,9 +542,9 @@ struct Downloader {
 
 impl Downloader {
     fn new(
-        hashes: Arc<HashMap<NodeId, Hash>>,
+        hashes: HashMap<NodeId, Hash>,
         size: usize,
-        pool: Arc<ConnectionPool>,
+        pool: &ConnectionPool,
         latency: &HashMap<NodeId, Duration>,
         config: Config,
     ) -> Self {
@@ -555,7 +553,7 @@ impl Downloader {
         Self {
             ctx: Arc::new(Ctx {
                 target: Mutex::new(target),
-                pool,
+                pool: pool.clone(),
             }),
             tasks: FuturesUnordered::new(),
             unclaimed,
@@ -778,7 +776,7 @@ impl Downloader {
 
 struct Ctx {
     target: Mutex<Target>,
-    pool: Arc<ConnectionPool>,
+    pool: ConnectionPool,
 }
 
 impl Ctx {
