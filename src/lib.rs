@@ -40,7 +40,7 @@ async fn get_latency_and_size(
     let (size, _stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
     let latency = config
         .latency
-        .get(node_id)
+        .get(&node_id)
         .cloned()
         .unwrap_or_else(|| conn.rtt());
     Ok((latency, size))
@@ -51,8 +51,8 @@ async fn get_latency_and_size(
 /// This gives us some initial estimate of the connection quality and also will
 /// immediately filter out nodes that are not reachable.
 async fn get_latencies_and_sizes(
-    infos: &HashMap<NodeId, Hash>,
-    pool: &ConnectionPool,
+    infos: Arc<HashMap<NodeId, Hash>>,
+    pool: Arc<ConnectionPool>,
     config: &Config,
 ) -> HashMap<NodeId, Result<(Duration, u64)>> {
     let copy = infos
@@ -63,7 +63,7 @@ async fn get_latencies_and_sizes(
         .map(|(id, hash)| {
             let pool = pool.clone();
             async move {
-                match get_latency_and_size(pool, id, &hash).await {
+                match get_latency_and_size(pool, id, &hash, config).await {
                     Ok((latency, size)) => (id, Ok((latency, size))),
                     Err(e) => (id, Err(e)),
                 }
@@ -145,7 +145,7 @@ pub async fn sync(
         Default::default(),
     ));
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, &config).await;
+    let latencies_and_sizes = get_latencies_and_sizes(hashes.clone(), pool.clone(), &config).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
