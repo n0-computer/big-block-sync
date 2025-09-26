@@ -83,6 +83,10 @@ async fn sync_future_compilation_test() -> TestResult<()> {
     Ok(())
 }
 
+/// Just performs a download from 8 possible sources and checks that
+/// 1. The download is successful
+/// 2. The downloaded data is complete
+/// 3. config.parallelism sources are used
 #[tokio::test]
 async fn smoke() -> TestResult<()> {
     let size = 1024 * 1024;
