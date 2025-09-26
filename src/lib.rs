@@ -31,16 +31,16 @@ mod tests;
 /// We get the size just so we have timings, then get the latency from the
 /// endpoint.
 async fn get_latency_and_size(
-    pool: &ConnectionPool,
-    node_id: &NodeId,
+    pool: Arc<ConnectionPool>,
+    node_id: NodeId,
     hash: &Hash,
     config: &Config,
 ) -> Result<(Duration, u64)> {
-    let conn = pool.get_or_connect(*node_id).await?;
+    let conn = pool.get_or_connect(node_id).await?;
     let (size, _stats) = iroh_blobs::get::request::get_verified_size(&conn, &hash).await?;
     let latency = config
         .latency
-        .get(node_id)
+        .get(&node_id)
         .cloned()
         .unwrap_or_else(|| conn.rtt());
     Ok((latency, size))
@@ -51,17 +51,21 @@ async fn get_latency_and_size(
 /// This gives us some initial estimate of the connection quality and also will
 /// immediately filter out nodes that are not reachable.
 async fn get_latencies_and_sizes(
-    infos: &HashMap<NodeId, Hash>,
-    pool: &ConnectionPool,
+    infos: Arc<HashMap<NodeId, Hash>>,
+    pool: Arc<ConnectionPool>,
     config: &Config,
 ) -> HashMap<NodeId, Result<(Duration, u64)>> {
-    stream::iter(infos.iter().clone())
+    let copy = infos
+        .iter()
+        .map(|(id, hash)| (id.clone(), hash.clone()))
+        .collect::<Vec<_>>();
+    stream::iter(copy.into_iter())
         .map(|(id, hash)| {
             let pool = pool.clone();
             async move {
-                match get_latency_and_size(&pool, id, hash, config).await {
-                    Ok((latency, size)) => (*id, Ok((latency, size))),
-                    Err(e) => (*id, Err(e)),
+                match get_latency_and_size(pool, id, &hash, config).await {
+                    Ok((latency, size)) => (id, Ok((latency, size))),
+                    Err(e) => (id, Err(e)),
                 }
             }
         })
@@ -112,10 +116,12 @@ pub async fn sync(
     verbose: u8,
 ) -> Result<(Vec<u8>, HashMap<NodeId, PerNodeStats>)> {
     // if there are multiple hashes for one node id, we will just choose the last one!
-    let hashes = blobs
-        .iter()
-        .map(|(addr, hash)| (addr.node_id, *hash))
-        .collect::<HashMap<_, _>>();
+    let hashes = Arc::new(
+        blobs
+            .iter()
+            .map(|(addr, hash)| (addr.node_id, *hash))
+            .collect::<HashMap<_, _>>(),
+    );
     // we take all addr info. If there are multiple, they will be combined except for
     // the relay url, which will be the last one.
     let addrs = blobs
@@ -133,9 +139,13 @@ pub async fn sync(
         .bind()
         .await?;
     // create a connection pool
-    let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, Default::default());
+    let pool = Arc::new(ConnectionPool::new(
+        endpoint.clone(),
+        iroh_blobs::ALPN,
+        Default::default(),
+    ));
     // get latency and size for all nodes. This should be very quick!
-    let latencies_and_sizes = get_latencies_and_sizes(&hashes, &pool, &config).await;
+    let latencies_and_sizes = get_latencies_and_sizes(hashes.clone(), pool.clone(), &config).await;
     let sizes = latencies_and_sizes
         .iter()
         .filter_map(|(_, res)| res.as_ref().ok().map(|(_, s)| *s))
@@ -522,7 +532,7 @@ struct Downloader {
     /// Unclaimed chunks that are not yet assigned to any download
     unclaimed: ChunkRanges,
     /// Mapping from node id to hash, to know what do download
-    hashes: HashMap<NodeId, Hash>,
+    hashes: Arc<HashMap<NodeId, Hash>>,
     /// Per node statistics. Note that this will also be filled for nodes we never
     /// talked to, using the initial latency.
     stats: HashMap<NodeId, PerNodeStats>,
@@ -534,9 +544,9 @@ struct Downloader {
 
 impl Downloader {
     fn new(
-        hashes: HashMap<NodeId, Hash>,
+        hashes: Arc<HashMap<NodeId, Hash>>,
         size: usize,
-        pool: ConnectionPool,
+        pool: Arc<ConnectionPool>,
         latency: &HashMap<NodeId, Duration>,
         config: Config,
     ) -> Self {
@@ -663,6 +673,7 @@ impl Downloader {
     ///
     /// The latter will only happen as the download nears the end, so it is called
     /// finish mode.
+    ///
     async fn claim_and_spawn(&mut self) -> Result<()> {
         let chunk_size = ChunkNum(self.config.block_size);
         let claim = claim(&self.unclaimed, chunk_size);
@@ -767,7 +778,7 @@ impl Downloader {
 
 struct Ctx {
     target: Mutex<Target>,
-    pool: ConnectionPool,
+    pool: Arc<ConnectionPool>,
 }
 
 impl Ctx {

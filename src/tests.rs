@@ -5,6 +5,8 @@ use iroh_blobs::Hash;
 use n0_future::{BufferedStreamExt, StreamExt, stream};
 use testresult::TestResult;
 
+use send_future::SendFuture as _;
+
 use crate::{Config, PerNodeStats, sync, tests::test_provider::TestProvider};
 
 const SETUP_PARALLELISM: usize = 32;
@@ -60,6 +62,25 @@ fn used_providers(stats: &HashMap<NodeId, PerNodeStats>) -> usize {
         .iter()
         .filter(|(_, stats)| !stats.ranges.is_empty())
         .count()
+}
+
+/// Tests that the trait bounds required in send_future::SendFuture are met
+/// as they have been found to be required to run in a tokio::spawn context
+#[tokio::test]
+async fn sync_future_compilation_test() -> TestResult<()> {
+    let config = Config {
+        parallelism: 8,
+        block_size: 1024,
+        min_rate: None,
+
+        rate_ratio: None,
+
+        latency: HashMap::new(),
+    };
+
+    let _res = sync(Vec::new(), config, 0).send().await;
+
+    Ok(())
 }
 
 /// Just performs a download from 8 possible sources and checks that
